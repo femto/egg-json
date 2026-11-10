@@ -1,0 +1,782 @@
+// json: reading and writing JSON (RFC 8259).
+//
+// Reading: parse makes a Doc, which owns everything it read: one buffer of
+// nodes, every value in order, and one of the text of its strings, with
+// their escapes undone. A Value names a node of a doc. It is a plain
+// value, copied freely, and means nothing without its doc.
+//
+//     var doc = try json.parse(a, body)
+//     defer a.free(doc)
+//     const user = doc.get(doc.root(), "user") orelse return
+//     const age = doc.int(doc.get(user, "age") orelse return) orelse 0
+//     var it = doc.items(doc.get(user, "tags") orelse return)
+//     while (it.next(doc)) |tag| {
+//         io.print(doc.str(tag) orelse "?")
+//     }
+//
+// A number is an integer when it is written without a fraction or an
+// exponent and fits an i64 (int gives it; float gives any number). Strings
+// are UTF-8, checked as they are read.
+//
+// Writing: a Builder appends to a Buf(u8), putting in the commas and colons
+// and escaping strings. A mistake in the order of calls (a value where an
+// object wants a key, a second value at the top) makes finish an error.
+//
+//     var w = json.Builder.init()
+//     w.begin_object(a)
+//     w.key(a, "name")
+//     w.str(a, "egg")
+//     w.end_object(a)
+//     const out = try w.finish(a)
+//     defer a.free(out)
+uses alloc
+
+const text = @import("std/text")
+
+// Arrays and objects nested deeper than this are error.TooDeep, so a
+// hostile document cannot run the parser out of stack.
+const max_depth = 512
+
+const Kind = enum {
+    nil
+    boolean
+    number
+    string
+    array
+    object
+}
+
+// A node of a doc. For a string, start and len place its text in the doc's
+// text; for an array or an object, start is the index of the first node
+// after it (its own nodes come right after it) and len the number of
+// elements or members. flag is a boolean's value, and for a number whether
+// int holds it.
+const Node = struct {
+    kind: Kind
+    flag: bool
+    int: i64
+    float: f64
+    start: i64
+    len: i64
+}
+
+const Value = struct {
+    index: i64
+}
+
+// A key and its value, from Members.
+const Member = struct {
+    key: Value
+    value: Value
+}
+
+// The elements of an array, in order: while (it.next(doc)) |v| { ... }
+const Items = struct {
+    at: i64
+    end: i64
+
+    fn next(inout self: Items, doc: Doc) ?Value {
+        if (self.at >= self.end) {
+            return null
+        }
+        const v = Value{ .index = self.at }
+        self.at = doc.after(v)
+        return v
+    }
+}
+
+// The members of an object, in order: while (it.next(doc)) |m| { ... }
+const Members = struct {
+    at: i64
+    end: i64
+
+    fn next(inout self: Members, doc: Doc) ?Member {
+        if (self.at >= self.end) {
+            return null
+        }
+        const m = Member{ .key = Value{ .index = self.at }, .value = Value{ .index = self.at + 1 } }
+        self.at = doc.after(m.value)
+        return m
+    }
+}
+
+const Doc = struct {
+    nodes: Buf(Node)
+    text: Buf(u8)
+
+    // The value the whole document is.
+    fn root(self: Doc) Value {
+        return Value{ .index = 0 }
+    }
+
+    fn kind(self: Doc, v: Value) Kind {
+        return self.nodes[v.index].kind
+    }
+
+    fn is_null(self: Doc, v: Value) bool {
+        return self.nodes[v.index].kind == .nil
+    }
+
+    fn boolean(self: Doc, v: Value) ?bool {
+        const n = self.nodes[v.index]
+        if (n.kind != .boolean) {
+            return null
+        }
+        return n.flag
+    }
+
+    // A number written as an integer that fits an i64.
+    fn int(self: Doc, v: Value) ?i64 {
+        const n = self.nodes[v.index]
+        if (n.kind != .number or !n.flag) {
+            return null
+        }
+        return n.int
+    }
+
+    // Any number, rounded to the nearest f64 (inf when too big).
+    fn float(self: Doc, v: Value) ?f64 {
+        const n = self.nodes[v.index]
+        if (n.kind != .number) {
+            return null
+        }
+        return n.float
+    }
+
+    // A string's text, a part of the doc.
+    fn str(self: Doc, v: Value) ?[]u8 {
+        const n = self.nodes[v.index]
+        if (n.kind != .string) {
+            return null
+        }
+        return self.text[n.start..n.start + n.len]
+    }
+
+    // The number of elements of an array or members of an object; 0 for
+    // anything else.
+    fn len(self: Doc, v: Value) i64 {
+        const n = self.nodes[v.index]
+        if (n.kind == .array or n.kind == .object) {
+            return n.len
+        }
+        return 0
+    }
+
+    // Element i of an array (counting the ones before it).
+    fn at(self: Doc, v: Value, i: i64) ?Value {
+        if (self.nodes[v.index].kind != .array or i < 0) {
+            return null
+        }
+        var it = self.items(v)
+        var k = 0
+        while (it.next(self)) |e| {
+            if (k == i) {
+                return e
+            }
+            k = k + 1
+        }
+        return null
+    }
+
+    // The value of an object's member named key; the last one when the
+    // name is given more than once, as in JavaScript.
+    fn get(self: Doc, v: Value, key: []u8) ?Value {
+        var found: ?Value = null
+        if (self.nodes[v.index].kind != .object) {
+            return null
+        }
+        var it = self.members(v)
+        while (it.next(self)) |m| {
+            const n = self.nodes[m.key.index]
+            if (self.text[n.start..n.start + n.len] == key) {
+                found = m.value
+            }
+        }
+        return found
+    }
+
+    // The elements of an array (none for anything else).
+    fn items(self: Doc, v: Value) Items {
+        const n = self.nodes[v.index]
+        if (n.kind != .array) {
+            return Items{ .at = 0, .end = 0 }
+        }
+        return Items{ .at = v.index + 1, .end = n.start }
+    }
+
+    // The members of an object (none for anything else).
+    fn members(self: Doc, v: Value) Members {
+        const n = self.nodes[v.index]
+        if (n.kind != .object) {
+            return Members{ .at = 0, .end = 0 }
+        }
+        return Members{ .at = v.index + 1, .end = n.start }
+    }
+
+    // The index of the first node after v and everything inside it.
+    fn after(self: Doc, v: Value) i64 {
+        const n = self.nodes[v.index]
+        if (n.kind == .array or n.kind == .object) {
+            return n.start
+        }
+        return v.index + 1
+    }
+}
+
+// ---- reading ------------------------------------------------------------
+
+// The document that is all of src (white space around it allowed).
+// error.Syntax for anything that is not JSON, error.TooDeep for nesting
+// deeper than max_depth.
+fn parse(a: Allocator, src: []u8) !Doc {
+    var at = 0
+    return parse_at(a, src, &at)
+}
+
+// parse, also saying where it stopped: on an error, the byte offset in src
+// where the document stops being JSON.
+fn parse_at(a: Allocator, src: []u8, inout at: i64) !Doc {
+    var p = Parser{ .pos = 0, .depth = 0, .nodes = .empty, .text = .empty }
+    p.value(a, src) catch |e| {
+        at = p.pos
+        a.free(p)
+        return e
+    }
+    p.skip_space(src)
+    at = p.pos
+    if (p.pos != @len(src)) {
+        a.free(p)
+        return error.Syntax
+    }
+    return Doc{ .nodes = p.nodes, .text = p.text }
+}
+
+const Parser = struct {
+    pos: i64
+    depth: i64
+    nodes: Buf(Node)
+    text: Buf(u8)
+
+    fn skip_space(inout self: Parser, src: []u8) void {
+        while (self.pos < @len(src)) {
+            const c = src[self.pos]
+            if (c != ' ' and c != '\t' and c != '\n' and c != '\r') {
+                return
+            }
+            self.pos = self.pos + 1
+        }
+    }
+
+    fn add(inout self: Parser, a: Allocator, kind: Kind) i64 {
+        a.push(&self.nodes, Node{ .kind = kind, .flag = false, .int = 0, .float = 0, .start = 0, .len = 0 })
+        return @len(self.nodes) - 1
+    }
+
+    fn value(inout self: Parser, a: Allocator, src: []u8) !void {
+        self.skip_space(src)
+        if (self.pos >= @len(src)) {
+            return error.Syntax
+        }
+        const c = src[self.pos]
+        if (c == '{') {
+            try self.object(a, src)
+        } else if (c == '[') {
+            try self.array(a, src)
+        } else if (c == '"') {
+            const n = self.add(a, .string)
+            self.nodes[n].start = @len(self.text)
+            try self.string(a, src)
+            self.nodes[n].len = @len(self.text) - self.nodes[n].start
+        } else if (c == 't') {
+            try self.word(src, "true")
+            const n = self.add(a, .boolean)
+            self.nodes[n].flag = true
+        } else if (c == 'f') {
+            try self.word(src, "false")
+            _ = self.add(a, .boolean)
+        } else if (c == 'n') {
+            try self.word(src, "null")
+            _ = self.add(a, .nil)
+        } else if (c == '-' or (c >= '0' and c <= '9')) {
+            try self.number(a, src)
+        } else {
+            return error.Syntax
+        }
+    }
+
+    fn word(inout self: Parser, src: []u8, w: []u8) !void {
+        if (@len(src) - self.pos < @len(w) or src[self.pos..self.pos + @len(w)] != w) {
+            return error.Syntax
+        }
+        self.pos = self.pos + @len(w)
+    }
+
+    fn enter(inout self: Parser) !void {
+        self.depth = self.depth + 1
+        if (self.depth > max_depth) {
+            return error.TooDeep
+        }
+    }
+
+    fn array(inout self: Parser, a: Allocator, src: []u8) !void {
+        try self.enter()
+        const me = self.add(a, .array)
+        self.pos = self.pos + 1
+        var count = 0
+        self.skip_space(src)
+        if (self.pos < @len(src) and src[self.pos] == ']') {
+            self.pos = self.pos + 1
+        } else {
+            while (true) {
+                try self.value(a, src)
+                count = count + 1
+                try self.separator(src, ']')
+                if (src[self.pos - 1] == ']') {
+                    break
+                }
+            }
+        }
+        self.nodes[me].start = @len(self.nodes)
+        self.nodes[me].len = count
+        self.depth = self.depth - 1
+    }
+
+    fn object(inout self: Parser, a: Allocator, src: []u8) !void {
+        try self.enter()
+        const me = self.add(a, .object)
+        self.pos = self.pos + 1
+        var count = 0
+        self.skip_space(src)
+        if (self.pos < @len(src) and src[self.pos] == '}') {
+            self.pos = self.pos + 1
+        } else {
+            while (true) {
+                self.skip_space(src)
+                if (self.pos >= @len(src) or src[self.pos] != '"') {
+                    return error.Syntax
+                }
+                const k = self.add(a, .string)
+                self.nodes[k].start = @len(self.text)
+                try self.string(a, src)
+                self.nodes[k].len = @len(self.text) - self.nodes[k].start
+                self.skip_space(src)
+                if (self.pos >= @len(src) or src[self.pos] != ':') {
+                    return error.Syntax
+                }
+                self.pos = self.pos + 1
+                try self.value(a, src)
+                count = count + 1
+                try self.separator(src, '}')
+                if (src[self.pos - 1] == '}') {
+                    break
+                }
+            }
+        }
+        self.nodes[me].start = @len(self.nodes)
+        self.nodes[me].len = count
+        self.depth = self.depth - 1
+    }
+
+    // A ',' or the closing byte, after white space.
+    fn separator(inout self: Parser, src: []u8, close: u8) !void {
+        self.skip_space(src)
+        if (self.pos >= @len(src)) {
+            return error.Syntax
+        }
+        const c = src[self.pos]
+        if (c != ',' and c != close) {
+            return error.Syntax
+        }
+        self.pos = self.pos + 1
+    }
+
+    // The string at pos (its opening quote), its text appended to self.text
+    // with the escapes undone.
+    fn string(inout self: Parser, a: Allocator, src: []u8) !void {
+        self.pos = self.pos + 1
+        while (self.pos < @len(src)) {
+            const c = src[self.pos]
+            if (c == '"') {
+                self.pos = self.pos + 1
+                return
+            }
+            if (c < 0x20) {
+                return error.Syntax
+            }
+            if (c == '\\') {
+                try self.escape(a, src)
+            } else if (c < 0x80) {
+                // A run of plain bytes is copied at once.
+                const start = self.pos
+                self.pos = self.pos + 1
+                while (self.pos < @len(src) and src[self.pos] < 0x80 and src[self.pos] >= 0x20 and src[self.pos] != '"' and src[self.pos] != '\\') {
+                    self.pos = self.pos + 1
+                }
+                a.append_str(&self.text, src[start..self.pos])
+            } else {
+                const n = utf8_len(src, self.pos)
+                if (n == 0) {
+                    return error.Syntax
+                }
+                a.append_str(&self.text, src[self.pos..self.pos + n])
+                self.pos = self.pos + n
+            }
+        }
+        return error.Syntax
+    }
+
+    fn escape(inout self: Parser, a: Allocator, src: []u8) !void {
+        if (self.pos + 1 >= @len(src)) {
+            return error.Syntax
+        }
+        const e = src[self.pos + 1]
+        self.pos = self.pos + 2
+        if (e == '"' or e == '\\' or e == '/') {
+            a.push(&self.text, e)
+        } else if (e == 'b') {
+            a.push(&self.text, 8)
+        } else if (e == 'f') {
+            a.push(&self.text, 12)
+        } else if (e == 'n') {
+            a.push(&self.text, '\n')
+        } else if (e == 'r') {
+            a.push(&self.text, '\r')
+        } else if (e == 't') {
+            a.push(&self.text, '\t')
+        } else if (e == 'u') {
+            var cp = try self.hex4(src)
+            if (cp >= 0xDC00 and cp <= 0xDFFF) {
+                return error.Syntax
+            }
+            if (cp >= 0xD800 and cp <= 0xDBFF) {
+                // A high surrogate: a low one must follow.
+                if (@len(src) - self.pos < 6 or src[self.pos] != '\\' or src[self.pos + 1] != 'u') {
+                    return error.Syntax
+                }
+                self.pos = self.pos + 2
+                const lo = try self.hex4(src)
+                if (lo < 0xDC00 or lo > 0xDFFF) {
+                    return error.Syntax
+                }
+                cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00)
+            }
+            append_utf8(a, &self.text, cp)
+        } else {
+            self.pos = self.pos - 2
+            return error.Syntax
+        }
+    }
+
+    fn hex4(inout self: Parser, src: []u8) !i64 {
+        if (@len(src) - self.pos < 4) {
+            return error.Syntax
+        }
+        var n = 0
+        var i = 0
+        while (i < 4) {
+            const c = @as(i64, src[self.pos + i])
+            var d = 0
+            if (c >= '0' and c <= '9') {
+                d = c - '0'
+            } else if (c >= 'a' and c <= 'f') {
+                d = c - 'a' + 10
+            } else if (c >= 'A' and c <= 'F') {
+                d = c - 'A' + 10
+            } else {
+                return error.Syntax
+            }
+            n = n * 16 + d
+            i = i + 1
+        }
+        self.pos = self.pos + 4
+        return n
+    }
+
+    // -?(0|[1-9][0-9]*)(.[0-9]+)?([eE][+-]?[0-9]+)?
+    fn number(inout self: Parser, a: Allocator, src: []u8) !void {
+        const start = self.pos
+        var whole = true
+        if (src[self.pos] == '-') {
+            self.pos = self.pos + 1
+        }
+        if (self.pos < @len(src) and src[self.pos] == '0') {
+            self.pos = self.pos + 1
+        } else if (self.digits(src) == 0) {
+            return error.Syntax
+        }
+        if (self.pos < @len(src) and src[self.pos] == '.') {
+            whole = false
+            self.pos = self.pos + 1
+            if (self.digits(src) == 0) {
+                return error.Syntax
+            }
+        }
+        if (self.pos < @len(src) and (src[self.pos] == 'e' or src[self.pos] == 'E')) {
+            whole = false
+            self.pos = self.pos + 1
+            if (self.pos < @len(src) and (src[self.pos] == '+' or src[self.pos] == '-')) {
+                self.pos = self.pos + 1
+            }
+            if (self.digits(src) == 0) {
+                return error.Syntax
+            }
+        }
+        const t = src[start..self.pos]
+        const n = self.add(a, .number)
+        self.nodes[n].float = text.parse_float(t) orelse return error.Syntax
+        if (whole) {
+            if (text.parse_int(t)) |i| {
+                self.nodes[n].int = i
+                self.nodes[n].flag = true
+            }
+        }
+    }
+
+    fn digits(inout self: Parser, src: []u8) i64 {
+        const start = self.pos
+        while (self.pos < @len(src) and src[self.pos] >= '0' and src[self.pos] <= '9') {
+            self.pos = self.pos + 1
+        }
+        return self.pos - start
+    }
+}
+
+// The length of the UTF-8 sequence at s[i], or 0 if it is not a valid one
+// (overlong, a surrogate, past U+10FFFF, or cut short).
+fn utf8_len(s: []u8, i: i64) i64 {
+    const c = s[i]
+    var n = 0
+    var lo: u8 = 0x80
+    var hi: u8 = 0xBF
+    if (c >= 0xC2 and c <= 0xDF) {
+        n = 2
+    } else if (c >= 0xE0 and c <= 0xEF) {
+        n = 3
+        if (c == 0xE0) {
+            lo = 0xA0
+        } else if (c == 0xED) {
+            hi = 0x9F
+        }
+    } else if (c >= 0xF0 and c <= 0xF4) {
+        n = 4
+        if (c == 0xF0) {
+            lo = 0x90
+        } else if (c == 0xF4) {
+            hi = 0x8F
+        }
+    } else {
+        return 0
+    }
+    if (@len(s) - i < n) {
+        return 0
+    }
+    // The second byte has the narrowed range, the rest 0x80..0xBF.
+    if (s[i + 1] < lo or s[i + 1] > hi) {
+        return 0
+    }
+    var k = 2
+    while (k < n) {
+        if (s[i + k] < 0x80 or s[i + k] > 0xBF) {
+            return 0
+        }
+        k = k + 1
+    }
+    return n
+}
+
+fn append_utf8(a: Allocator, inout out: Buf(u8), cp: i64) void {
+    if (cp < 0x80) {
+        a.push(&out, @as(u8, cp))
+    } else if (cp < 0x800) {
+        a.push(&out, @as(u8, 0xC0 | (cp >> 6)))
+        a.push(&out, @as(u8, 0x80 | (cp & 0x3F)))
+    } else if (cp < 0x10000) {
+        a.push(&out, @as(u8, 0xE0 | (cp >> 12)))
+        a.push(&out, @as(u8, 0x80 | ((cp >> 6) & 0x3F)))
+        a.push(&out, @as(u8, 0x80 | (cp & 0x3F)))
+    } else {
+        a.push(&out, @as(u8, 0xF0 | (cp >> 18)))
+        a.push(&out, @as(u8, 0x80 | ((cp >> 12) & 0x3F)))
+        a.push(&out, @as(u8, 0x80 | ((cp >> 6) & 0x3F)))
+        a.push(&out, @as(u8, 0x80 | (cp & 0x3F)))
+    }
+}
+
+// ---- writing ------------------------------------------------------------
+
+// s as a JSON string, quoted and escaped, appended to out.
+fn quote(a: Allocator, inout out: Buf(u8), s: []u8) void {
+    a.push(&out, '"')
+    for (s) |c| {
+        if (c == '"') {
+            a.append_str(&out, "\\\"")
+        } else if (c == '\\') {
+            a.append_str(&out, "\\\\")
+        } else if (c == '\n') {
+            a.append_str(&out, "\\n")
+        } else if (c == '\r') {
+            a.append_str(&out, "\\r")
+        } else if (c == '\t') {
+            a.append_str(&out, "\\t")
+        } else if (c < 0x20) {
+            const digits = "0123456789abcdef"
+            a.append_str(&out, "\\u00")
+            a.push(&out, digits[@as(i64, c >> 4)])
+            a.push(&out, digits[@as(i64, c & 15)])
+        } else {
+            a.push(&out, c)
+        }
+    }
+    a.push(&out, '"')
+}
+
+// Builds one JSON document. Each container open is a byte of open: 'a' for
+// an array, 'o' for an object. first: nothing written yet in the innermost
+// one; keyed: an object's key written, its value not yet; bad: a call came
+// out of order.
+const Builder = struct {
+    out: Buf(u8)
+    open: Buf(u8)
+    first: bool
+    keyed: bool
+    done: bool
+    bad: bool
+
+    fn init() Builder {
+        return Builder{ .out = .empty, .open = .empty, .first = true, .keyed = false, .done = false, .bad = false }
+    }
+
+    // The document, or error.Incomplete if a container is still open or
+    // nothing was written, error.Misuse if a call came out of order.
+    fn finish(sink self: Builder, a: Allocator) !Buf(u8) {
+        const bad = self.bad
+        const done = self.done
+        a.free(self.open)
+        if (bad) {
+            a.free(self.out)
+            return error.Misuse
+        }
+        if (!done) {
+            a.free(self.out)
+            return error.Incomplete
+        }
+        return self.out
+    }
+
+    fn begin_object(inout self: Builder, a: Allocator) void {
+        self.before_value(a)
+        a.push(&self.out, '{')
+        a.push(&self.open, 'o')
+        self.first = true
+    }
+
+    fn end_object(inout self: Builder, a: Allocator) void {
+        self.close(a, 'o', '}')
+    }
+
+    fn begin_array(inout self: Builder, a: Allocator) void {
+        self.before_value(a)
+        a.push(&self.out, '[')
+        a.push(&self.open, 'a')
+        self.first = true
+    }
+
+    fn end_array(inout self: Builder, a: Allocator) void {
+        self.close(a, 'a', ']')
+    }
+
+    // The name of an object's next member.
+    fn key(inout self: Builder, a: Allocator, k: []u8) void {
+        const n = @len(self.open)
+        if (n == 0 or self.open[n - 1] != 'o' or self.keyed) {
+            self.bad = true
+            return
+        }
+        if (!self.first) {
+            a.push(&self.out, ',')
+        }
+        quote(a, &self.out, k)
+        a.push(&self.out, ':')
+        self.keyed = true
+    }
+
+    fn str(inout self: Builder, a: Allocator, s: []u8) void {
+        self.before_value(a)
+        quote(a, &self.out, s)
+        self.after_value()
+    }
+
+    fn int(inout self: Builder, a: Allocator, n: i64) void {
+        self.before_value(a)
+        a.append_int(&self.out, n)
+        self.after_value()
+    }
+
+    // JSON has no inf or nan: they are written as null, as JavaScript does.
+    fn float(inout self: Builder, a: Allocator, x: f64) void {
+        self.before_value(a)
+        if (x != x or x - x != 0) {
+            a.append_str(&self.out, "null")
+        } else {
+            a.append_float(&self.out, x)
+        }
+        self.after_value()
+    }
+
+    fn boolean(inout self: Builder, a: Allocator, b: bool) void {
+        self.before_value(a)
+        a.append_str(&self.out, if (b) "true" else "false")
+        self.after_value()
+    }
+
+    fn nil(inout self: Builder, a: Allocator) void {
+        self.before_value(a)
+        a.append_str(&self.out, "null")
+        self.after_value()
+    }
+
+    // JSON text written by the caller, taken as one value as it is.
+    fn raw(inout self: Builder, a: Allocator, json_text: []u8) void {
+        self.before_value(a)
+        a.append_str(&self.out, json_text)
+        self.after_value()
+    }
+
+    fn before_value(inout self: Builder, a: Allocator) void {
+        const n = @len(self.open)
+        if (n == 0) {
+            if (self.done) {
+                self.bad = true
+            }
+            return
+        }
+        if (self.open[n - 1] == 'o') {
+            if (!self.keyed) {
+                self.bad = true
+            }
+            return
+        }
+        if (!self.first) {
+            a.push(&self.out, ',')
+        }
+    }
+
+    fn after_value(inout self: Builder) void {
+        self.first = false
+        self.keyed = false
+        if (@len(self.open) == 0) {
+            self.done = true
+        }
+    }
+
+    fn close(inout self: Builder, a: Allocator, kind: u8, c: u8) void {
+        const n = @len(self.open)
+        if (n == 0 or self.open[n - 1] != kind or self.keyed) {
+            self.bad = true
+            return
+        }
+        _ = a.pop(&self.open)
+        a.push(&self.out, c)
+        self.after_value()
+    }
+}

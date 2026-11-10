@@ -1,0 +1,289 @@
+// The tests of the json package: each check prints its name when it fails,
+// and main fails if any did.
+uses io, alloc
+
+const json = @import("json")
+
+const Tally = struct {
+    passed: i64
+    failed: i64
+
+    fn check(inout self: Tally, io: Io, ok: bool, name: str) void {
+        if (ok) {
+            self.passed = self.passed + 1
+        } else {
+            self.failed = self.failed + 1
+            io.print("FAIL ", name)
+        }
+    }
+}
+
+fn main(io: Io, a: Allocator) !void {
+    var t = Tally{ .passed = 0, .failed = 0 }
+    try reading(io, a, &t)
+    numbers(io, a, &t)
+    strings(io, a, &t)
+    errors(io, a, &t)
+    building(io, a, &t)
+    io.print(t.passed, " passed, ", t.failed, " failed")
+    if (t.failed > 0) {
+        return error.Failed
+    }
+}
+
+fn reading(io: Io, a: Allocator, inout t: Tally) !void {
+    const src = " {\"name\": \"egg\", \"tags\": [1, 2, [3], {\"x\": null}], \"ok\": true, \"no\": false, \"empty\": {}, \"none\": []} "
+    const doc = try json.parse(a, src)
+    defer a.free(doc)
+    const root = doc.root()
+    t.check(io, doc.kind(root) == .object and doc.len(root) == 6, "root is an object of 6")
+    const name = doc.get(root, "name") orelse return error.Missing
+    t.check(io, (doc.str(name) orelse "") == "egg", "a string member")
+    t.check(io, none_of(doc.get(root, "nope")), "a missing member")
+    const tags = doc.get(root, "tags") orelse return error.Missing
+    t.check(io, doc.len(tags) == 4, "an array's length")
+    t.check(io, (doc.int(doc.at(tags, 1) orelse root) orelse 0) == 2, "at")
+    t.check(io, none_of(doc.at(tags, 4)) and none_of(doc.at(tags, -1)), "at out of range")
+    const third = doc.at(tags, 2) orelse root
+    t.check(io, doc.kind(third) == .array and (doc.int(doc.at(third, 0) orelse root) orelse 0) == 3, "a nested array")
+    const fourth = doc.at(tags, 3) orelse root
+    t.check(io, doc.is_null(doc.get(fourth, "x") orelse root), "null")
+    t.check(io, (doc.boolean(doc.get(root, "ok") orelse root) orelse false), "true")
+    t.check(io, !(doc.boolean(doc.get(root, "no") orelse root) orelse true), "false")
+    t.check(io, doc.len(doc.get(root, "empty") orelse root) == 0 and doc.kind(doc.get(root, "empty") orelse root) == .object, "an empty object")
+    t.check(io, doc.len(doc.get(root, "none") orelse root) == 0, "an empty array")
+    // items skips over what is nested in each element.
+    var sum = 0
+    var count = 0
+    var it = doc.items(tags)
+    while (it.next(doc)) |v| {
+        sum = sum + (doc.int(v) orelse 0)
+        count = count + 1
+    }
+    t.check(io, count == 4 and sum == 3, "items")
+    var keys: Buf(u8) = .empty
+    defer a.free(keys)
+    var ms = doc.members(root)
+    while (ms.next(doc)) |m| {
+        a.append_str(&keys, doc.str(m.key) orelse "?")
+        a.push(&keys, ',')
+    }
+    t.check(io, keys == "name,tags,ok,no,empty,none,", "members in order")
+    t.check(io, no_text(doc.str(tags)) and no_int(doc.int(name)) and no_bool(doc.boolean(name)), "the wrong kind is null")
+    t.check(io, none_of(doc.get(tags, "x")) and none_of(doc.at(root, 0)), "get on an array, at on an object")
+    const dup = try json.parse(a, "{\"a\": 1, \"a\": 2}")
+    defer a.free(dup)
+    t.check(io, (doc_int(dup, dup.get(dup.root(), "a")) orelse 0) == 2, "the last of a repeated key")
+}
+
+fn none_of(v: ?json.Value) bool {
+    if (v) |x| {
+        _ = x
+        return false
+    }
+    return true
+}
+
+fn no_int(v: ?i64) bool {
+    if (v) |x| {
+        _ = x
+        return false
+    }
+    return true
+}
+
+fn no_text(v: ?[]u8) bool {
+    if (v) |x| {
+        _ = x
+        return false
+    }
+    return true
+}
+
+fn no_bool(v: ?bool) bool {
+    if (v) |x| {
+        _ = x
+        return false
+    }
+    return true
+}
+
+fn doc_int(doc: json.Doc, v: ?json.Value) ?i64 {
+    const x = v orelse return null
+    return doc.int(x)
+}
+
+// The number src holds, as an int and as a float.
+fn number(a: Allocator, src: []u8, inout i: ?i64, inout f: ?f64) bool {
+    const doc = json.parse(a, src) catch return false
+    defer a.free(doc)
+    i = doc.int(doc.root())
+    f = doc.float(doc.root())
+    return true
+}
+
+fn numbers(io: Io, a: Allocator, inout t: Tally) void {
+    var i: ?i64 = null
+    var f: ?f64 = null
+    t.check(io, number(a, "0", &i, &f) and (i orelse 1) == 0 and (f orelse 1) == 0, "0")
+    t.check(io, number(a, "-12", &i, &f) and (i orelse 0) == -12, "-12")
+    t.check(io, number(a, "1.5", &i, &f) and no_int(i) and (f orelse 0) == 1.5, "1.5 is not an int")
+    t.check(io, number(a, "1e3", &i, &f) and no_int(i) and (f orelse 0) == 1000, "1e3 is a float")
+    t.check(io, number(a, "-0.25E-2", &i, &f) and (f orelse 0) == -0.0025, "an exponent")
+    t.check(io, number(a, "9223372036854775807", &i, &f) and (i orelse 0) == 9223372036854775807, "the largest i64")
+    t.check(io, number(a, "-9223372036854775808", &i, &f) and (i orelse 0) == -9223372036854775807 - 1, "the smallest i64")
+    t.check(io, number(a, "9223372036854775808", &i, &f) and no_int(i) and (f orelse 0) == 9223372036854775808.0, "past i64: a float")
+    t.check(io, number(a, "1e400", &i, &f) and (f orelse 0) > 1e308, "too big: inf")
+    t.check(io, number(a, "0.1", &i, &f) and (f orelse 0) == 0.1, "0.1 rounds right")
+}
+
+fn str_of(a: Allocator, src: []u8, inout out: Buf(u8)) bool {
+    const doc = json.parse(a, src) catch return false
+    defer a.free(doc)
+    a.resize(&out, 0, 0)
+    a.append_str(&out, doc.str(doc.root()) orelse return false)
+    return true
+}
+
+fn strings(io: Io, a: Allocator, inout t: Tally) void {
+    var s: Buf(u8) = .empty
+    defer a.free(s)
+    t.check(io, str_of(a, "\"a\\nb\\t\\\"q\\\" \\\\ \\/\"", &s) and s == "a\nb\t\"q\" \\ /", "simple escapes")
+    t.check(io, str_of(a, "\"\\b\\f\\r\"", &s) and @len(s) == 3 and s[0] == 8 and s[1] == 12 and s[2] == 13, "\\b \\f \\r")
+    t.check(io, str_of(a, "\"caf\\u00e9\"", &s) and s == "café", "\\u00e9")
+    t.check(io, str_of(a, "\"\\u4e2d\\u6587\"", &s) and s == "中文", "\\u4e2d\\u6587")
+    t.check(io, str_of(a, "\"\\ud83d\\ude00\"", &s) and s == "😀", "a surrogate pair")
+    t.check(io, str_of(a, "\"中文 😀\"", &s) and s == "中文 😀", "UTF-8 as it is")
+    t.check(io, str_of(a, "\"\"", &s) and @len(s) == 0, "an empty string")
+}
+
+fn fails(a: Allocator, src: []u8, want: anyerror) bool {
+    const doc = json.parse(a, src) catch |e| {
+        return e == want
+    }
+    a.free(doc)
+    return false
+}
+
+fn errors(io: Io, a: Allocator, inout t: Tally) void {
+    const bad = [_]str{ "", " ", "{", "[1,]", "[,1]", "{\"a\":1,}", "{\"a\" 1}", "{1:2}", "01", "1.", ".5", "-",
+        "+1", "1e", "tru", "nul", "\"abc", "\"\\x\"", "\"\\u12\"", "\"\\ud800\"", "\"\\udc00\"", "\"\\ud800\\u0041\"",
+        "\"a\tb\"", "1 2", "[1] x", "NaN", "Infinity", "'a'", "[1 2]", "{\"a\":1 \"b\":2}" }
+    for (bad) |src| {
+        t.check(io, fails(a, src, error.Syntax), src)
+    }
+    // Bytes that are not UTF-8 in a string.
+    var raw: Buf(u8) = .empty
+    defer a.free(raw)
+    const not_utf8 = [_]u8{ 0xff, 0xc0, 0x80, 0xed, 0xa0, 0x80 }
+    var k = 0
+    while (k < 6) {
+        a.resize(&raw, 0, 0)
+        a.push(&raw, '"')
+        a.push(&raw, not_utf8[k])
+        if (not_utf8[k] >= 0xc0) {
+            a.push(&raw, not_utf8[k + 1])
+            if (not_utf8[k] == 0xed) {
+                a.push(&raw, not_utf8[k + 2])
+            }
+        }
+        a.push(&raw, '"')
+        t.check(io, fails(a, raw, error.Syntax), "bytes that are not UTF-8")
+        k = k + if (not_utf8[k] == 0xff) 1 else if (not_utf8[k] == 0xc0) 2 else 3
+    }
+    // Nesting: 512 deep is fine, 513 is too deep.
+    var deep: Buf(u8) = .empty
+    defer a.free(deep)
+    var i = 0
+    while (i < 512) {
+        a.push(&deep, '[')
+        i = i + 1
+    }
+    while (i > 0) {
+        a.push(&deep, ']')
+        i = i - 1
+    }
+    const ok = json.parse(a, deep) catch json.Doc{ .nodes = .empty, .text = .empty }
+    t.check(io, @len(ok.nodes) == 512, "512 deep")
+    a.free(ok)
+    a.resize(&deep, 0, 0)
+    while (i < 513) {
+        a.push(&deep, '[')
+        i = i + 1
+    }
+    t.check(io, fails(a, deep, error.TooDeep), "513 deep")
+    var at = 0
+    const doc = json.parse_at(a, "[1, 2, x]", &at) catch json.Doc{ .nodes = .empty, .text = .empty }
+    a.free(doc)
+    t.check(io, at == 7, "parse_at says where")
+}
+
+fn building(io: Io, a: Allocator, inout t: Tally) void {
+    var b = json.Builder.init()
+    b.begin_object(a)
+    b.key(a, "name")
+    b.str(a, "e\"g\ng\u{1}")
+    b.key(a, "list")
+    b.begin_array(a)
+    b.int(a, -3)
+    b.float(a, 1.5)
+    b.float(a, 1e300 * 1e300)
+    b.boolean(a, true)
+    b.nil(a)
+    b.begin_object(a)
+    b.end_object(a)
+    b.raw(a, "[1,2]")
+    b.end_array(a)
+    b.key(a, "n")
+    b.int(a, 0)
+    b.end_object(a)
+    const out = b.finish(a) catch a.concat("finish failed", "")
+    defer a.free(out)
+    const want = "{\"name\":\"e\\\"g\\ng\\u0001\",\"list\":[-3,1.5,null,true,null,{},[1,2]],\"n\":0}"
+    t.check(io, out == want, "a built document")
+    if (out != want) {
+        io.print(out)
+    }
+    // It reads back.
+    const doc = json.parse(a, out) catch json.Doc{ .nodes = .empty, .text = .empty }
+    defer a.free(doc)
+    t.check(io, @len(doc.nodes) > 0 and (doc.str(doc.get(doc.root(), "name") orelse doc.root()) orelse "") == "e\"g\ng\u{1}", "and reads back")
+
+    t.check(io, misuse(a, 0) == error.Misuse, "a value where a key goes")
+    t.check(io, misuse(a, 1) == error.Misuse, "a key in an array")
+    t.check(io, misuse(a, 2) == error.Misuse, "two values at the top")
+    t.check(io, misuse(a, 3) == error.Misuse, "the wrong end")
+    t.check(io, misuse(a, 4) == error.Incomplete, "an open array")
+    t.check(io, misuse(a, 5) == error.Incomplete, "nothing written")
+    t.check(io, misuse(a, 6) == error.Misuse, "a key with no value")
+}
+
+fn misuse(a: Allocator, how: i64) anyerror {
+    var b = json.Builder.init()
+    if (how == 0) {
+        b.begin_object(a)
+        b.int(a, 1)
+        b.end_object(a)
+    } else if (how == 1) {
+        b.begin_array(a)
+        b.key(a, "k")
+        b.end_array(a)
+    } else if (how == 2) {
+        b.int(a, 1)
+        b.int(a, 2)
+    } else if (how == 3) {
+        b.begin_array(a)
+        b.end_object(a)
+    } else if (how == 4) {
+        b.begin_array(a)
+    } else if (how == 6) {
+        b.begin_object(a)
+        b.key(a, "k")
+        b.end_object(a)
+    }
+    const out = b.finish(a) catch |e| {
+        return e
+    }
+    a.free(out)
+    return error.None
+}

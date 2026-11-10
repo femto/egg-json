@@ -39,11 +39,11 @@ fn reading(io: Io, a: Allocator, inout t: Tally) !void {
     t.check(io, doc.kind(root) == .object and doc.len(root) == 6, "root is an object of 6")
     const name = doc.get(root, "name") orelse return error.Missing
     t.check(io, (doc.str(name) orelse "") == "egg", "a string member")
-    t.check(io, none_of(doc.get(root, "nope")), "a missing member")
+    t.check(io, doc.get(root, "nope") == null, "a missing member")
     const tags = doc.get(root, "tags") orelse return error.Missing
     t.check(io, doc.len(tags) == 4, "an array's length")
     t.check(io, (doc.int(doc.at(tags, 1) orelse root) orelse 0) == 2, "at")
-    t.check(io, none_of(doc.at(tags, 4)) and none_of(doc.at(tags, -1)), "at out of range")
+    t.check(io, doc.at(tags, 4) == null and doc.at(tags, -1) == null, "at out of range")
     const third = doc.at(tags, 2) orelse root
     t.check(io, doc.kind(third) == .array and (doc.int(doc.at(third, 0) orelse root) orelse 0) == 3, "a nested array")
     const fourth = doc.at(tags, 3) orelse root
@@ -69,43 +69,11 @@ fn reading(io: Io, a: Allocator, inout t: Tally) !void {
         a.push(&keys, ',')
     }
     t.check(io, keys == "name,tags,ok,no,empty,none,", "members in order")
-    t.check(io, no_text(doc.str(tags)) and no_int(doc.int(name)) and no_bool(doc.boolean(name)), "the wrong kind is null")
-    t.check(io, none_of(doc.get(tags, "x")) and none_of(doc.at(root, 0)), "get on an array, at on an object")
+    t.check(io, doc.str(tags) == null and doc.int(name) == null and doc.boolean(name) == null, "the wrong kind is null")
+    t.check(io, doc.get(tags, "x") == null and doc.at(root, 0) == null, "get on an array, at on an object")
     const dup = try json.parse(a, "{\"a\": 1, \"a\": 2}")
     defer a.free(dup)
     t.check(io, (doc_int(dup, dup.get(dup.root(), "a")) orelse 0) == 2, "the last of a repeated key")
-}
-
-fn none_of(v: ?json.Value) bool {
-    if (v) |x| {
-        _ = x
-        return false
-    }
-    return true
-}
-
-fn no_int(v: ?i64) bool {
-    if (v) |x| {
-        _ = x
-        return false
-    }
-    return true
-}
-
-fn no_text(v: ?[]u8) bool {
-    if (v) |x| {
-        _ = x
-        return false
-    }
-    return true
-}
-
-fn no_bool(v: ?bool) bool {
-    if (v) |x| {
-        _ = x
-        return false
-    }
-    return true
 }
 
 fn doc_int(doc: json.Doc, v: ?json.Value) ?i64 {
@@ -127,12 +95,12 @@ fn numbers(io: Io, a: Allocator, inout t: Tally) void {
     var f: ?f64 = null
     t.check(io, number(a, "0", &i, &f) and (i orelse 1) == 0 and (f orelse 1) == 0, "0")
     t.check(io, number(a, "-12", &i, &f) and (i orelse 0) == -12, "-12")
-    t.check(io, number(a, "1.5", &i, &f) and no_int(i) and (f orelse 0) == 1.5, "1.5 is not an int")
-    t.check(io, number(a, "1e3", &i, &f) and no_int(i) and (f orelse 0) == 1000, "1e3 is a float")
+    t.check(io, number(a, "1.5", &i, &f) and i == null and (f orelse 0) == 1.5, "1.5 is not an int")
+    t.check(io, number(a, "1e3", &i, &f) and i == null and (f orelse 0) == 1000, "1e3 is a float")
     t.check(io, number(a, "-0.25E-2", &i, &f) and (f orelse 0) == -0.0025, "an exponent")
     t.check(io, number(a, "9223372036854775807", &i, &f) and (i orelse 0) == 9223372036854775807, "the largest i64")
     t.check(io, number(a, "-9223372036854775808", &i, &f) and (i orelse 0) == -9223372036854775807 - 1, "the smallest i64")
-    t.check(io, number(a, "9223372036854775808", &i, &f) and no_int(i) and (f orelse 0) == 9223372036854775808.0, "past i64: a float")
+    t.check(io, number(a, "9223372036854775808", &i, &f) and i == null and (f orelse 0) == 9223372036854775808.0, "past i64: a float")
     t.check(io, number(a, "1e400", &i, &f) and (f orelse 0) > 1e308, "too big: inf")
     t.check(io, number(a, "0.1", &i, &f) and (f orelse 0) == 0.1, "0.1 rounds right")
 }

@@ -94,4 +94,4 @@ string by itself.
 cd test && clutch run
 ```
 
-Needs an eggc with `std/text`'s `parse_float` (egg #98).
+Needs an eggc from after egg #98 (`std/text`'s `parse_float`).

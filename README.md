@@ -45,8 +45,8 @@ A `Doc` owns everything it read, in two buffers: its nodes, every value in
 the order it was written, and the text of its strings with their escapes
 undone. `a.free(doc)` frees both. A `Value` names one node. It is a plain
 value, copied freely, and meaningful only with its doc. There is no tree of
-small allocations, because an Egg union cannot hold a buffer. The layout is
-simdjson's tape.
+small allocations: reading costs two growing buffers however large the
+document is. The layout is simdjson's tape.
 
 | `doc.` | gives |
 | --- | --- |
@@ -91,7 +91,8 @@ string by itself.
 ## Tests
 
 ```
-cd test && clutch run
+clutch test
 ```
 
-Needs an eggc from after egg #98 (`std/text`'s `parse_float`).
+`test/json.egg` is the test program. Needs an eggc from after egg #101
+(`clutch test`; `std/text`'s `parse_float` came in #98).

@@ -1,5 +1,5 @@
-// The tests of the json package: each check prints its name when it fails,
-// and main fails if any did.
+// The tests of the json package, run by clutch test: each check prints its
+// name when it fails, and main fails if any did.
 uses io, alloc
 
 const json = @import("json")
